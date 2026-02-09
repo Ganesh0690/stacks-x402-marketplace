@@ -10,87 +10,162 @@ const sellerCode = `import express from "express";
 import { paymentMiddleware } from "x402-stacks";
 
 const app = express();
+app.use(express.json());
 
-app.use(paymentMiddleware(
-  "YOUR_STACKS_ADDRESS",
-  {
-    "/api/summarize": {
-      price: "0.005",
-      token: "STX",
-      network: "stacks-mainnet",
-    },
-    "/api/generate-image": {
-      price: "0.00005",
-      token: "sBTC",
-      network: "stacks-mainnet",
-    },
-  }
-));
+const summarizeGate = paymentMiddleware({
+  payTo: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
+  amount: "5000",           // 5000 microSTX = 0.005 STX
+  tokenType: "STX",
+  network: "stacks:1",      // CAIP-2 format
+  facilitatorUrl: "https://x402-facilitator.stacksx402.com",
+  scheme: "exact",
+  maxTimeoutSeconds: 300,
+});
 
-app.post("/api/summarize", (req, res) => {
+const imageGate = paymentMiddleware({
+  payTo: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
+  amount: "5000",
+  tokenType: "sBTC",
+  network: "stacks:1",
+  facilitatorUrl: "https://x402-facilitator.stacksx402.com",
+  scheme: "exact",
+});
+
+app.post("/api/summarize", summarizeGate, (req, res) => {
   const result = summarizeText(req.body.text);
   res.json({ summary: result });
 });
 
+app.post("/api/generate-image", imageGate, (req, res) => {
+  const image = generateImage(req.body.prompt);
+  res.json({ image_url: image });
+});
+
 app.listen(3001, () => {
-  console.log("x402 protected server running on :3001");
+  console.log("x402-protected server running on :3001");
 });`;
 
-const buyerCode = `import { createX402Client } from "x402-stacks/client";
+const buyerCode = `import { generateKeypair } from "x402-stacks";
 
-const client = createX402Client({
-  privateKey: process.env.STACKS_PRIVATE_KEY,
-  network: "stacks-mainnet",
+// Step 1: Call the endpoint (no payment)
+const res = await fetch("http://localhost:3001/api/summarize", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ text: "Your long document here..." }),
 });
 
-const response = await client.fetch(
-  "https://neuraltext.stacksx402.com/api/summarize",
-  {
-    method: "POST",
-    body: JSON.stringify({
-      text: "Your long document here...",
-      max_length: 200,
-    }),
-  }
-);
+// Step 2: Parse 402 Payment Required response
+// res.status === 402
+const { accepts } = await res.json();
+// accepts[0] = {
+//   scheme: "exact",
+//   network: "stacks:1",
+//   amount: "5000",
+//   asset: "STX",
+//   payTo: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7"
+// }
 
-const data = await response.json();
+// Step 3: Sign payment with your Stacks wallet
+const requirement = accepts[0];
+const payload = {
+  x402Version: 2,
+  scheme: requirement.scheme,
+  network: requirement.network,
+  payload: {
+    amount: requirement.amount,
+    asset: requirement.asset,
+    payTo: requirement.payTo,
+    payer: "YOUR_STACKS_ADDRESS",
+  },
+};
+const signature = Buffer.from(
+  JSON.stringify(payload)
+).toString("base64");
+
+// Step 4: Re-send with payment-signature header
+const paid = await fetch("http://localhost:3001/api/summarize", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "payment-signature": signature,
+  },
+  body: JSON.stringify({ text: "Your long document here..." }),
+});
+
+// Step 5: Receive the data (200 OK)
+const data = await paid.json();
 console.log(data.summary);`;
 
-const agentCode = `import { createX402Client } from "x402-stacks/client";
+const agentCode = `import { generateKeypair } from "x402-stacks";
 
-const agentWallet = createX402Client({
-  privateKey: process.env.AGENT_PRIVATE_KEY,
-  network: "stacks-mainnet",
-  maxBudget: "1.0",
-  budgetToken: "STX",
-});
+// Agent generates its own wallet
+const wallet = generateKeypair();
+console.log("Agent address:", wallet.address);
 
-async function researchTask(topic) {
-  const summary = await agentWallet.fetch(
-    "https://neuraltext.stacksx402.com/api/summarize",
-    { method: "POST", body: JSON.stringify({ text: topic }) }
-  );
+// Autonomous function: discover → pay → consume
+async function callPaidAPI(endpoint, body) {
+  // 1. Call without payment
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-  const translation = await agentWallet.fetch(
-    "https://translatex.stacksx402.com/api/translate",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        text: (await summary.json()).summary,
-        source: "en",
-        target: "es",
-      }),
-    }
-  );
+  if (res.status !== 402) return res.json();
 
-  return translation.json();
+  // 2. Parse payment requirements
+  const { accepts } = await res.json();
+  const req = accepts[0];
+
+  // 3. Sign payment
+  const payload = {
+    x402Version: 2,
+    scheme: req.scheme,
+    network: req.network,
+    payload: {
+      amount: req.amount,
+      asset: req.asset,
+      payTo: req.payTo,
+      payer: wallet.address,
+    },
+  };
+  const sig = Buffer.from(
+    JSON.stringify(payload)
+  ).toString("base64");
+
+  // 4. Re-send with payment
+  const paid = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "payment-signature": sig,
+    },
+    body: JSON.stringify(body),
+  });
+
+  return paid.json();
 }
 
-const result = await researchTask("Quantum computing advances...");`;
+// Agent autonomously chains multiple API calls
+async function researchTask(topic) {
+  const summary = await callPaidAPI(
+    "http://localhost:3001/api/summarize",
+    { text: topic }
+  );
+
+  const sentiment = await callPaidAPI(
+    "http://localhost:3001/api/sentiment",
+    { text: summary.summary }
+  );
+
+  return { summary, sentiment };
+}
+
+const result = await researchTask("Quantum computing advances...");
+console.log(result);`;
 
 const registerCode = `const response = await fetch(
-  "https://agentmarket.stacksx402.com/api/registry",
+  "https://stacks-x402-marketplace.vercel.app/api/registry",
   {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -200,7 +275,8 @@ export default function DocsPage() {
               <p style={{ fontSize: 14, color: "var(--text-secondary)", lineHeight: 1.6 }}>
                 The x402-stacks package provides everything you need to accept and make
                 payments using the x402 protocol on Stacks. It supports settlement in
-                STX, sBTC, and USDCx tokens.
+                STX, sBTC, and USDCx tokens. Each endpoint gets its own payment gate
+                with independent pricing and token selection.
               </p>
             </div>
 
@@ -229,13 +305,14 @@ export default function DocsPage() {
               <div className="fade-in">
                 <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>Monetize Your API</h3>
                 <p style={{ fontSize: 14, color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
-                  Add the x402-stacks payment middleware to your Express.js server. Define
-                  routes with pricing, and the middleware handles the entire 402 handshake
-                  automatically. When a request arrives without payment, it returns HTTP 402
-                  with payment details. When payment is included, it verifies and settles
-                  before serving the response.
+                  Add the x402-stacks paymentMiddleware to your Express.js server. Each
+                  endpoint gets its own payment gate with a config object specifying the
+                  pay-to address, amount in micro-units, token type, and network in CAIP-2
+                  format. The middleware returns HTTP 402 with payment details when no
+                  payment header is present, and verifies payments via the facilitator
+                  when a payment-signature header is included.
                 </p>
-                <CodeBlock code={sellerCode} filename="server.ts" />
+                <CodeBlock code={sellerCode} filename="server.js" />
               </div>
             )}
 
@@ -243,11 +320,13 @@ export default function DocsPage() {
               <div className="fade-in">
                 <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>Consume Paid APIs</h3>
                 <p style={{ fontSize: 14, color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
-                  Use the x402-stacks client to make requests to x402-protected endpoints.
-                  The client automatically handles 402 responses, signs payment transactions,
-                  and retries the request with the payment header.
+                  Call any x402-protected endpoint. The server responds with HTTP 402 and
+                  payment requirements (amount, token, network, pay-to address). Parse the
+                  requirements, sign a payment payload with your Stacks wallet, encode it
+                  as base64, and re-send the request with the payment-signature header.
+                  The server verifies and settles before returning your data.
                 </p>
-                <CodeBlock code={buyerCode} filename="client.ts" />
+                <CodeBlock code={buyerCode} filename="client.js" />
               </div>
             )}
 
@@ -255,11 +334,12 @@ export default function DocsPage() {
               <div className="fade-in">
                 <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>AI Agent Integration</h3>
                 <p style={{ fontSize: 14, color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
-                  Give your AI agent a wallet with a budget. The agent can autonomously discover,
-                  pay for, and consume marketplace services without human intervention. Set budget
-                  limits to control spending.
+                  Give your AI agent its own Stacks wallet using generateKeypair(). The
+                  agent autonomously discovers endpoints, handles 402 responses, signs
+                  payments, and consumes services — no human in the loop. Chain multiple
+                  paid API calls together for complex workflows.
                 </p>
-                <CodeBlock code={agentCode} filename="agent.ts" />
+                <CodeBlock code={agentCode} filename="agent.js" />
               </div>
             )}
 
@@ -272,10 +352,10 @@ export default function DocsPage() {
             }}>
               <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>Register Your Service</h3>
               <p style={{ fontSize: 14, color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
-                List your API on the AgentMarket registry so buyers and agents can
+                List your API on the marketplace registry so buyers and agents can
                 discover it. Use the REST API to register programmatically.
               </p>
-              <CodeBlock code={registerCode} filename="register.ts" />
+              <CodeBlock code={registerCode} filename="register.js" />
             </div>
 
             <div style={{
